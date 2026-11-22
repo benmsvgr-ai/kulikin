@@ -26,3 +26,10 @@ Piano 88 tuts, Panduan Musik, Circle of Fifths, Jalur Chord, Belajar Notasi, Tra
 ## Catatan teknis
 
 Website statis dapat di-host di GitHub Pages. Pemisahan audio dan transkripsi AI sungguhan dari rekaman tetap memerlukan mesin pemrosesan lokal atau server. Pembaruan desain dan transpose tidak mengubah akurasi model transkripsi audio yang sudah ada.
+
+## v1.3 - Video Piano Roll MP4
+Di Piano Roll Jatuh tekan **↓ Video MP4** setelah not tersedia. Pilih HD 720p / Full HD 1080p,
+kemudian proses berjalan di mesin lokal Windows lewat FFmpeg. Nada yang ditranspose,
+kecepatan dan volume ikut pada hasil; audio MP4 memakai suara grand piano dari nada MIDI,
+bukan audio asli YouTube. Instal file tambahan lewat `engine/INSTALL_MP4_WINDOWS.bat`
+dan restart `START_WINDOWS.bat`. Batas durasi 30 menit per video.

@@ -736,6 +736,36 @@ async function analyzeUploadedAudio(){
  }catch(err){if(rollState.worker){rollState.worker.terminate();rollState.worker=null;}msg.textContent='Analisis gagal: '+(err.message||err);toast('Deteksi audio gagal. Coba file WAV/MP3 atau pilih mode Melodi utama.');}
  finally{btn.disabled=false;btn.textContent='♫ Analisis Audio → MIDI';}
 }
+// Offline MP4 export in Windows engine; uses the piano roll's current notes and transpose.
+let videoExportInProgress=false;
+async function exportRollVideo(){
+ if(videoExportInProgress)return;
+ if(!rollState.notes.length){toast('Belum ada nada. Impor MIDI, analisis audio, atau klik Contoh dulu.');return;}
+ const msg=$('#roll-video-message'),link=$('#roll-video-download'),button=$('#roll-video-export');
+ const wrap=$('#mp4-progress-wrap'),bar=$('#roll-video-progress'),pct=$('#roll-video-progress-text');
+ const usable=rollState.notes.map(n=>({...n,midi:rollPitch(n)})).filter(n=>n.midi>=21&&n.midi<=108&&n.start>=0&&n.duration>0);
+ if(!usable.length){toast('Nada setelah transpose berada di luar jangkauan 88 tuts.');return;}
+ videoExportInProgress=true;button.disabled=true;link.hidden=true;wrap.hidden=false;bar.value=0;pct.textContent='0%';
+ msg.textContent='Menghubungi mesin lokal...';
+ const url='http://127.0.0.1:8765';
+ try{
+  const length=fallDuration();if(length>1800)throw Error('Ekspor dibatasi 30 menit per video.');
+  const payload={notes:usable.map(n=>({midi:n.midi,start:n.start,duration:n.duration,velocity:n.velocity||85,source:n.source||'analyzed'})),duration:length,speed:rollState.rate,volume:midiVolumePercent,resolution:$('#roll-video-resolution').value,title:'KULIKIN · Piano Roll'};
+  let response;try{response=await fetch(url+'/api/video/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});}catch(_){throw Error('Mesin lokal tidak tersambung. Jalankan START_WINDOWS.bat dari engine KULIKIN v1.3.');}
+  if(!response.ok){const err=await response.json().catch(()=>({}));throw Error(err.detail||'Mesin lokal menolak permintaan MP4. Update engine ke v1.3.');}
+  const {job_id}=await response.json();
+  for(;;){
+   await new Promise(resolve=>setTimeout(resolve,1300));
+   let statusResponse;try{statusResponse=await fetch(url+'/api/video/status/'+encodeURIComponent(job_id));}catch(_){throw Error('Koneksi mesin lokal terputus. Periksa CMD engine.');}
+   if(!statusResponse.ok)throw Error('Tidak bisa memantau ekspor MP4.');
+   const job=await statusResponse.json();bar.value=Math.max(0,Math.min(100,job.progress||0));pct.textContent=String(Math.round(bar.value))+'%';msg.textContent=job.stage||'Membuat MP4...';
+   if(job.status==='failed')throw Error(job.error||'Gagal membuat MP4.');
+   if(job.status==='done'){link.href=url+job.download;link.hidden=false;msg.textContent='Video siap diunduh · suara piano dan transpose sudah termasuk.';toast('MP4 selesai. Klik Unduh MP4.');break;}
+  }
+ }catch(err){msg.textContent='Ekspor gagal: '+(err.message||err);toast('MP4 gagal. Periksa mesin lokal dan FFmpeg.');}
+ finally{videoExportInProgress=false;button.disabled=false;}
+}
+
 function initTranscription(){
  loadRollTranspose();
  try{const v=Number(localStorage.getItem('chord-atlas-midi-volume'));if(v>=50&&v<=250)midiVolumePercent=v;}catch(_){/* local storage may be disabled */}
@@ -753,7 +783,7 @@ function initTranscription(){
  $('#roll-shift-up').addEventListener('click',()=>changeRollTranspose(rollTranspose+1));
  $('#roll-shift-reset').addEventListener('click',()=>changeRollTranspose(0));
  $('#roll-play').addEventListener('click',playRoll);$('#roll-stop').addEventListener('click',()=>{stopRoll();rollState.playhead=-2.8;renderRoll()});
- $('#roll-demo').addEventListener('click',demoRoll);$('#roll-export').addEventListener('click',exportRollMidi);
+ $('#roll-demo').addEventListener('click',demoRoll);$('#roll-export').addEventListener('click',exportRollMidi);$('#roll-video-export').addEventListener('click',exportRollVideo);
  $('#roll-clear').addEventListener('click',()=>{stopRoll();rollState.notes=[];rollState.seconds=16;rollState.playhead=-2.8;renderRoll()});
  $('#roll-edit-toggle').addEventListener('click',()=>{const wrap=$('#roll-editor-wrap'),expanded=wrap.hidden;wrap.hidden=!expanded;$('#roll-edit-toggle').setAttribute('aria-expanded',String(expanded));$('#roll-edit-toggle').textContent=expanded?'✕ Tutup editor':'✎ Editor nada';});
  $('#fall-speed').addEventListener('change',e=>{const next=Number(e.target.value);if(!Number.isFinite(next)||next<=0)return;const wasPlaying=rollState.playing;if(wasPlaying)stopRoll();rollState.rate=next;if(wasPlaying)playRoll();});
