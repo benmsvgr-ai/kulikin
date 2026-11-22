@@ -297,7 +297,7 @@ function resizeFallCanvas(){
  drawFallingRoll();
 }
 function fallTime(sec){const x=Math.max(0,sec);return String(Math.floor(x/60)).padStart(2,'0')+':'+String(Math.floor(x%60)).padStart(2,'0')}
-function fallDuration(){return rollState.notes.length?Math.max(1,rollState.notes.reduce((max,n)=>Math.max(max,n.start+n.duration),0)):Math.max(16,rollState.seconds);}
+function fallDuration(){return Math.max(1,rollState.seconds,rollState.notes.reduce((max,n)=>Math.max(max,n.start+n.duration),0));}
 function drawFallingRoll(){
  const canvas=$('#fall-canvas');if(!canvas||!fallCanvasReady)return;
  const ctx=canvas.getContext('2d');if(!ctx)return;
@@ -354,7 +354,7 @@ function addRollNote(midi,start,duration=null,source='manual'){
  const bpm=Math.max(40,Math.min(240,Number($('#roll-bpm').value)||110)),beat=60/bpm;
  rollState.notes.push({midi:Math.round(midi),start:Math.round(Math.max(0,start)/beat*4)/4*beat,duration:duration||beat,source});
  rollState.notes.sort((a,b)=>a.start-b.start||a.midi-b.midi);
- rollState.seconds=Math.min(240,Math.max(rollState.seconds,start+(duration||beat)+1));renderRoll();
+ rollState.seconds=Math.max(rollState.seconds,start+(duration||beat)+1);renderRoll();
 }
 function stopRoll(){
  rollState.playing=false;for(const t of rollState.timers)clearTimeout(t);rollState.timers=[];
@@ -514,7 +514,7 @@ function openReference(){
 }
 // Capture via browser tab sharing permission. Never download audio by URL or read iframe contents.
 const captureState={stream:null,recorder:null,chunks:[],timer:null,start:0,stopping:false,lastError:''};
-const CAPTURE_RATE=11025,CAPTURE_LIMIT_SEC=240;
+const CAPTURE_RATE=11025,CAPTURE_LIMIT_SEC=1800; // 30 menit; tidak dipotong diam-diam
 function captureMessage(message){const el=$('#capture-status');if(el)el.textContent=message;}
 function captureUI(recording){$('#capture-start').disabled=recording;$('#capture-stop').disabled=!recording;$('#tab-capture-panel').classList.toggle('is-recording',recording)}
 async function startTabCapture(){
@@ -556,7 +556,7 @@ async function startTabCapture(){
    const sec=(performance.now()-captureState.start)/1000;
    $('#capture-elapsed').textContent=fallTime(sec);
    $('#capture-meter-fill').style.width=Math.min(100,sec/CAPTURE_LIMIT_SEC*100)+'%';
-   if(sec>=CAPTURE_LIMIT_SEC)finishTabCapture();
+   if(sec>=CAPTURE_LIMIT_SEC){captureMessage('Batas aman 30 menit tercapai; menyelesaikan rekaman untuk dianalisis.');finishTabCapture();}
   },250);
  }catch(err){stream.getTracks().forEach(t=>t.stop());captureState.stream=null;captureUI(false);captureMessage('Gagal merekam audio: '+(err.message||err.name));}
 }
@@ -600,45 +600,59 @@ async function getAiPianoModel(status){
  return aiPianoLoading;
 }
 async function runAiPianoAnalysis(msg,prog){
- if(!rollState.sourceBuffer&&!rollState.sourcePCM)throw new Error('Belum ada audio. Rekam tab atau unggah file dahulu.');
+ if(!rollState.sourceBuffer&&!rollState.sourcePCM)throw new Error('Belum ada audio. Rekam tab atau unggah audio dahulu.');
  const status=s=>{msg.textContent=s};
  const model=await getAiPianoModel(status);
  const ctx=audioContext();if(!ctx)throw new Error('Web Audio tidak tersedia.');
- const limit=Number($('#ai-limit').value)||60;
+ const requested=Number($('#ai-limit').value); // 0 = seluruh durasi
  let decoded;
  if(rollState.sourcePCM){
   const rate=rollState.sourceRate||11025;
-  const length=Math.min(rollState.sourcePCM.length,Math.floor(limit*rate));
+  const length=rollState.sourcePCM.length;
   decoded=ctx.createBuffer(1,length,rate);
-  decoded.copyToChannel(rollState.sourcePCM.slice(0,length),0);
+  decoded.copyToChannel(rollState.sourcePCM,0);
  }else{
-  status('Membaca rekaman audio…');
+  status('Membaca durasi audio sumber…');
   decoded=await ctx.decodeAudioData(rollState.sourceBuffer.slice(0));
  }
- const duration=Math.min(limit,decoded.duration,CAPTURE_LIMIT_SEC);
- if(duration<1)throw new Error('Audio terlalu pendek, rekam sedikitnya 1 detik.');
- const rate=decoded.sampleRate;
- const length=Math.max(1,Math.floor(duration*rate));
- let buffer=decoded;
- if(length<decoded.length){
-  buffer=ctx.createBuffer(decoded.numberOfChannels,length,rate);
-  for(let c=0;c<decoded.numberOfChannels;c++)buffer.copyToChannel(decoded.getChannelData(c).subarray(0,length),c);
+ const originalDuration=decoded.duration;
+ if(!Number.isFinite(originalDuration)||originalDuration<1)throw new Error('Durasi audio tidak terbaca.');
+ if(originalDuration>CAPTURE_LIMIT_SEC && !(requested>0&&requested<=CAPTURE_LIMIT_SEC))
+  throw new Error('Audio '+fallTime(originalDuration)+' melewati batas 30 menit per proses. Pilih cuplikan, atau bagi sumber menjadi beberapa bagian.');
+ const duration=Math.min(originalDuration,requested>0?requested:originalDuration,CAPTURE_LIMIT_SEC);
+ const rate=decoded.sampleRate,CHUNK=25,OVERLAP=.35,totalChunks=Math.ceil(duration/CHUNK),events=[];
+ for(let i=0;i<totalChunks;i++){
+  const offset=i*CHUNK,seconds=Math.min(duration-offset,CHUNK+OVERLAP);
+  const begin=Math.floor(offset*rate),size=Math.min(decoded.length-begin,Math.ceil(seconds*rate));
+  if(size<=0)break;
+  const part=ctx.createBuffer(decoded.numberOfChannels,size,rate);
+  for(let c=0;c<decoded.numberOfChannels;c++)part.copyToChannel(decoded.getChannelData(c).subarray(begin,begin+size),c);
+  status('AI Piano: memeriksa bagian '+(i+1)+'/'+totalChunks+' ('+fallTime(Math.min(offset,duration))+' / '+fallTime(duration)+').');
+  await new Promise(resolve=>setTimeout(resolve,0));
+  const seq=await model.transcribeFromAudioBuffer(part,1);
+  for(const n of seq.notes||[]){
+   const localStart=Number(n.startTime),localEnd=Number(n.endTime);
+   if(!Number.isInteger(n.pitch)||n.pitch<ROLL_LOW||n.pitch>ROLL_HIGH||!Number.isFinite(localStart)||!Number.isFinite(localEnd)||localEnd-localStart<.06)continue;
+   if(i<totalChunks-1&&localStart>=CHUNK)continue; // overlap hanya untuk konteks tepi
+   events.push({midi:n.pitch,start:Math.max(0,localStart+offset),duration:Math.max(.06,Math.min(duration,localEnd+offset)-Math.max(0,localStart+offset)),source:'analyzed'});
+  }
+  prog.value=Math.min(98,Math.round(10+(i+1)/totalChunks*88));
  }
- status('Model piano sedang membaca '+Math.round(duration)+' detik rekaman. Jangan tutup halaman…');
- prog.value=15;
- // Magenta mengembalikan NoteSequence dengan pitch, startTime, endTime.
- // Pemrosesan lebih berat daripada FFT; playback dan navigasi tetap tidak diubah.
- await new Promise(resolve=>requestAnimationFrame(()=>resolve()));
- const seq=await model.transcribeFromAudioBuffer(buffer,1);
- const events=(seq.notes||[]).map(n=>({midi:n.pitch,start:n.startTime,duration:n.endTime-n.startTime,source:'analyzed'}))
-  .filter(n=>Number.isInteger(n.midi)&&n.midi>=ROLL_LOW&&n.midi<=ROLL_HIGH&&Number.isFinite(n.start)&&n.start>=0&&Number.isFinite(n.duration)&&n.duration>=.06)
-  .sort((a,b)=>a.start-b.start||a.midi-b.midi).slice(0,8000);
- if(!events.length){status('AI Piano tidak mendeteksi nada yang cukup jelas. Coba piano solo atau impor MIDI.');prog.value=100;return;}
- stopRoll();rollState.midiAll=null;$('#midi-track-info').hidden=true;rollState.notes=events;rollState.seconds=Math.max(16,duration+1);rollState.playhead=-2.8;
+ events.sort((a,b)=>a.start-b.start||a.midi-b.midi);
+ const unique=[];
+ for(const n of events){
+  const last=unique.length?unique[unique.length-1]:null;
+  if(last&&last.midi===n.midi&&Math.abs(last.start-n.start)<.12){last.duration=Math.max(last.duration,n.start+n.duration-last.start);continue;}
+  unique.push(n);
+ }
+ stopRoll();rollState.midiAll=null;$('#midi-track-info').hidden=true;
+ rollState.notes=unique.slice(0,30000);rollState.seconds=duration;rollState.playhead=-2.8;
  renderRoll();prog.value=100;
- status('AI Piano: '+events.length+' nada perkiraan · '+Math.round(duration)+' detik. Tidak otomatis terpisah dari instrumen lain. Periksa hasil sebelum ekspor MIDI.');
+ if(unique.length===0)status('Durasi '+fallTime(duration)+' telah diperiksa, tetapi model tidak menemukan nada piano yang jelas. Coba stem piano terpisah.');
+ else status('AI Piano: '+rollState.notes.length+' nada perkiraan dari '+fallTime(duration)+' audio. Semua bagian dianalisis, tetapi not belum tentu akurat. Periksa sebelum ekspor MIDI.');
  document.querySelector('.roll-panel')?.scrollIntoView({behavior:'smooth',block:'start'});
 }
+
 const INSTRUMENTS={
  piano:{label:'PIANO',lo:36,hi:96,method:'piano_ai',mode:'poly',desc:'Piano akustik. AI Piano cocok untuk piano solo/rekaman bersih. MIDI bisa difilter berdasarkan instrumen.'},
  keyboard:{label:'KEYBOARD',lo:44,hi:96,method:'poly',mode:'poly',desc:'Keyboard / synth / organ. Dari MIDI bisa dipilih tepat menurut program instrumen. Dari audio campuran, hanya tebakan nada—bukan pemisahan synth.'},
@@ -653,7 +667,7 @@ function selectedInstrument(){return $('#instrument-focus')?.value||'piano'}
 function applyImportedMidiFocus({scroll=false}={}){
  if(!rollState.midiAll)return;
  const focus=selectedInstrument();let notes=focus==='all'?rollState.midiAll:rollState.midiAll.filter(n=>n.instrument===focus);
- stopRoll();rollState.notes=notes.slice(0,8000);rollState.seconds=Math.min(600,Math.max(16,rollState.midiAll.reduce((mx,n)=>Math.max(mx,n.start+n.duration),0)+2));rollState.playhead=-2.8;renderRoll();
+ stopRoll();rollState.notes=notes.slice(0,30000);rollState.seconds=Math.max(16,rollState.midiAll.reduce((mx,n)=>Math.max(mx,n.start+n.duration),0)+2);rollState.playhead=-2.8;renderRoll();
  const label=INSTRUMENTS[focus]?.label||focus;
  $('#analysis-message').textContent=`MIDI: ${rollState.notes.length} nada ${label.toLowerCase()} dari ${rollState.midiAll.length} nada. ${rollState.notes.length?'Pilih Putar untuk melihatnya.':'Tidak ada jalur instrumen ini. Coba Semua instrumen.'}`;
  const box=$('#midi-track-info');
@@ -703,15 +717,15 @@ async function analyzeUploadedAudio(){
  btn.disabled=true;btn.textContent='Menganalisis dengan FFT...';prog.value=0;msg.textContent='Membaca gelombang audio...';
  try{
   let raw,max;
-  if(rollState.sourcePCM){max=Math.min(rollState.sourcePCM.length/rollState.sourceRate,CAPTURE_LIMIT_SEC);raw=rollState.sourcePCM.slice(0,Math.floor(max*rollState.sourceRate));}
+  if(rollState.sourcePCM){max=rollState.sourcePCM.length/rollState.sourceRate;if(max>CAPTURE_LIMIT_SEC)throw Error('Durasi melebihi 30 menit; pecah audio menjadi beberapa bagian.');raw=rollState.sourcePCM.slice();}
   else{
    const ctx=audioContext();if(!ctx)throw Error('Web Audio belum didukung.');const decoded=await ctx.decodeAudioData(rollState.sourceBuffer.slice(0));
-   const rate=11025,step=decoded.sampleRate/rate;max=Math.min(decoded.duration,CAPTURE_LIMIT_SEC);
+   const rate=11025,step=decoded.sampleRate/rate;max=decoded.duration;if(max>CAPTURE_LIMIT_SEC)throw Error('Durasi melebihi 30 menit; pecah audio menjadi beberapa bagian.');
    const count=Math.floor(max*rate);raw=new Float32Array(count);const channels=Array.from({length:decoded.numberOfChannels},(_,c)=>decoded.getChannelData(c));
    for(let i=0;i<count;i++){const j=Math.floor(i*step);let val=0;for(const arr of channels)val+=arr[j]||0;raw[i]=val/channels.length;}
   }
   msg.textContent='Memisahkan nada dari rekaman (melodi atau chord)…';
-  const workerCode="onmessage=e=>{\n try{\n const data=new Float32Array(e.data.buffer),mode=e.data.mode||'melody',rate=11025;\n const hop=512,N=e.data.lowMidi<=35?4096:2048,minMidi=e.data.lowMidi||36,maxMidi=e.data.highMidi||96;\n const notesByFrame=[],total=Math.max(0,Math.floor((data.length-N)/hop));\n if(!total){postMessage({done:true,notes:[]});return;}\n const real=new Float32Array(N),imag=new Float32Array(N),power=new Float32Array(N/2);\n const rev=new Uint16Array(N);\n for(let i=0;i<N;i++){let x=i,r=0;for(let b=0;b<Math.log2(N);b++){r=(r<<1)|(x&1);x>>=1;}rev[i]=r;}\n // FFT iterative radix-2 + Hann window (browser local/offline)\n function spectrum(at){\n  let rms=0;\n  for(let i=0;i<N;i++){let v=data[at+i]||0;rms+=v*v;let w=.5-.5*Math.cos(2*Math.PI*i/(N-1)),j=rev[i];real[j]=v*w;imag[j]=0;}\n  for(let size=2;size<=N;size<<=1){let h=size>>1;\n   for(let from=0;from<N;from+=size)for(let j=0;j<h;j++){\n    const a=-2*Math.PI*j/size,wr=Math.cos(a),wi=Math.sin(a),id=from+j,other=id+h;\n    const tr=wr*real[other]-wi*imag[other],ti=wr*imag[other]+wi*real[other];\n    real[other]=real[id]-tr;imag[other]=imag[id]-ti;real[id]+=tr;imag[id]+=ti;\n   }\n  }\n  for(let i=0;i<power.length;i++)power[i]=Math.sqrt(real[i]*real[i]+imag[i]*imag[i]);\n  return Math.sqrt(rms/N);\n }\n function interp(bin){\n  if(bin<1||bin>=power.length-1)return 0;\n  const low=Math.floor(bin),frac=bin-low;\n  const a=Math.max(power[Math.max(1,low-1)],power[low],power[Math.min(power.length-1,low+1)]);\n  const b=Math.max(power[Math.max(1,low)],power[Math.min(power.length-1,low+1)],power[Math.min(power.length-1,low+2)]);\n  return a*(1-frac)+b*frac;\n }\n let maxAmp=0;for(let p=0;p<data.length;p+=101)maxAmp=Math.max(maxAmp,Math.abs(data[p]));\n const threshold=Math.max(.007,maxAmp*.023);\n for(let f=0;f<total;f++){\n  const rms=spectrum(f*hop);if(rms<threshold){notesByFrame.push([]);continue;}\n  const sal=[];\n  for(let m=minMidi;m<=maxMidi;m++){\n   const freq=440*Math.pow(2,(m-69)/12),bin=freq*N/rate;\n   let score=0;\n   for(let harm=1;harm<=Math.min(5,Math.floor(rate*.48/freq));harm++)score+=interp(bin*harm)/Math.pow(harm,1.12);\n   // favor the actual fundamental over a spurious octave\n   const fundamental=interp(bin);\n   score=score*.72+fundamental*.28;\n   sal.push({m,score});\n  }\n  sal.sort((a,b)=>b.score-a.score);\n  const best=sal[0]?.score||0;\n  if(best<.1){notesByFrame.push([]);continue;}\n  if(mode==='melody'){\n   let candidate=sal[0];\n   // a lightly weighted continuity prior avoids some octave jumps\n   const previous=notesByFrame.length?notesByFrame[notesByFrame.length-1][0]:null;\n   if(previous!==undefined&&previous!==null){const near=sal.find(s=>Math.abs(s.m-previous)<=2 && s.score>=best*.75);if(near)candidate=near;}\n   notesByFrame.push([candidate.m]);\n  }else{\n   // Experimental multi-note estimation. Avoid pure harmonic false positives by limiting to 4 notes.\n   const found=[],cutoff=best*.66;\n   for(const item of sal){\n    if(found.length>=4||item.score<cutoff)break;\n    if(found.some(n=>Math.abs(n-item.m)<=1))continue;\n    // octave harmonic collisions require extra prominence\n    if(found.some(n=>Math.abs(n-item.m)===12)&&item.score<best*.88)continue;\n    found.push(item.m);\n   }\n   notesByFrame.push(found);\n  }\n  if(f%65===0)postMessage({progress:Math.round(f/total*100)});\n }\n const count=new Map(),output=[],step=hop/rate;\n for(let i=0;i<notesByFrame.length;i++){\n  const list=new Set(notesByFrame[i]);\n  for(const [m,t] of count){if(!list.has(m)){if(i-t.from>=3)output.push({midi:m,start:t.from*step,duration:(i-t.from)*step,source:'analyzed'});count.delete(m)}}\n  for(const m of list)if(!count.has(m))count.set(m,{from:i});\n }\n for(const [m,t] of count)if(notesByFrame.length-t.from>=3)output.push({midi:m,start:t.from*step,duration:(notesByFrame.length-t.from)*step,source:'analyzed'});\n output.sort((a,b)=>a.start-b.start||a.midi-b.midi);\n // Merge brief neighboring notes of same pitch to remove fragmentation.\n const merged=[];\n for(const n of output){const last=merged.findLast(x=>x.midi===n.midi&&n.start-(x.start+x.duration)<.10&&n.start>=x.start);\n  if(last)last.duration=n.start+n.duration-last.start;else merged.push(n);\n }\n postMessage({done:true,notes:merged.slice(0,4000),duration:data.length/rate});\n }catch(err){postMessage({error:String(err?.message||err)})}\n};"
+  const workerCode="onmessage=e=>{\n try{\n const data=new Float32Array(e.data.buffer),mode=e.data.mode||'melody',rate=11025;\n const hop=512,N=e.data.lowMidi<=35?4096:2048,minMidi=e.data.lowMidi||36,maxMidi=e.data.highMidi||96;\n const notesByFrame=[],total=Math.max(0,Math.floor((data.length-N)/hop));\n if(!total){postMessage({done:true,notes:[]});return;}\n const real=new Float32Array(N),imag=new Float32Array(N),power=new Float32Array(N/2);\n const rev=new Uint16Array(N);\n for(let i=0;i<N;i++){let x=i,r=0;for(let b=0;b<Math.log2(N);b++){r=(r<<1)|(x&1);x>>=1;}rev[i]=r;}\n // FFT iterative radix-2 + Hann window (browser local/offline)\n function spectrum(at){\n  let rms=0;\n  for(let i=0;i<N;i++){let v=data[at+i]||0;rms+=v*v;let w=.5-.5*Math.cos(2*Math.PI*i/(N-1)),j=rev[i];real[j]=v*w;imag[j]=0;}\n  for(let size=2;size<=N;size<<=1){let h=size>>1;\n   for(let from=0;from<N;from+=size)for(let j=0;j<h;j++){\n    const a=-2*Math.PI*j/size,wr=Math.cos(a),wi=Math.sin(a),id=from+j,other=id+h;\n    const tr=wr*real[other]-wi*imag[other],ti=wr*imag[other]+wi*real[other];\n    real[other]=real[id]-tr;imag[other]=imag[id]-ti;real[id]+=tr;imag[id]+=ti;\n   }\n  }\n  for(let i=0;i<power.length;i++)power[i]=Math.sqrt(real[i]*real[i]+imag[i]*imag[i]);\n  return Math.sqrt(rms/N);\n }\n function interp(bin){\n  if(bin<1||bin>=power.length-1)return 0;\n  const low=Math.floor(bin),frac=bin-low;\n  const a=Math.max(power[Math.max(1,low-1)],power[low],power[Math.min(power.length-1,low+1)]);\n  const b=Math.max(power[Math.max(1,low)],power[Math.min(power.length-1,low+1)],power[Math.min(power.length-1,low+2)]);\n  return a*(1-frac)+b*frac;\n }\n let maxAmp=0;for(let p=0;p<data.length;p+=101)maxAmp=Math.max(maxAmp,Math.abs(data[p]));\n const threshold=Math.max(.007,maxAmp*.023);\n for(let f=0;f<total;f++){\n  const rms=spectrum(f*hop);if(rms<threshold){notesByFrame.push([]);continue;}\n  const sal=[];\n  for(let m=minMidi;m<=maxMidi;m++){\n   const freq=440*Math.pow(2,(m-69)/12),bin=freq*N/rate;\n   let score=0;\n   for(let harm=1;harm<=Math.min(5,Math.floor(rate*.48/freq));harm++)score+=interp(bin*harm)/Math.pow(harm,1.12);\n   // favor the actual fundamental over a spurious octave\n   const fundamental=interp(bin);\n   score=score*.72+fundamental*.28;\n   sal.push({m,score});\n  }\n  sal.sort((a,b)=>b.score-a.score);\n  const best=sal[0]?.score||0;\n  if(best<.1){notesByFrame.push([]);continue;}\n  if(mode==='melody'){\n   let candidate=sal[0];\n   // a lightly weighted continuity prior avoids some octave jumps\n   const previous=notesByFrame.length?notesByFrame[notesByFrame.length-1][0]:null;\n   if(previous!==undefined&&previous!==null){const near=sal.find(s=>Math.abs(s.m-previous)<=2 && s.score>=best*.75);if(near)candidate=near;}\n   notesByFrame.push([candidate.m]);\n  }else{\n   // Experimental multi-note estimation. Avoid pure harmonic false positives by limiting to 4 notes.\n   const found=[],cutoff=best*.66;\n   for(const item of sal){\n    if(found.length>=4||item.score<cutoff)break;\n    if(found.some(n=>Math.abs(n-item.m)<=1))continue;\n    // octave harmonic collisions require extra prominence\n    if(found.some(n=>Math.abs(n-item.m)===12)&&item.score<best*.88)continue;\n    found.push(item.m);\n   }\n   notesByFrame.push(found);\n  }\n  if(f%65===0)postMessage({progress:Math.round(f/total*100)});\n }\n const count=new Map(),output=[],step=hop/rate;\n for(let i=0;i<notesByFrame.length;i++){\n  const list=new Set(notesByFrame[i]);\n  for(const [m,t] of count){if(!list.has(m)){if(i-t.from>=3)output.push({midi:m,start:t.from*step,duration:(i-t.from)*step,source:'analyzed'});count.delete(m)}}\n  for(const m of list)if(!count.has(m))count.set(m,{from:i});\n }\n for(const [m,t] of count)if(notesByFrame.length-t.from>=3)output.push({midi:m,start:t.from*step,duration:(notesByFrame.length-t.from)*step,source:'analyzed'});\n output.sort((a,b)=>a.start-b.start||a.midi-b.midi);\n // Merge brief neighboring notes of same pitch to remove fragmentation.\n const merged=[];\n for(const n of output){const last=merged.findLast(x=>x.midi===n.midi&&n.start-(x.start+x.duration)<.10&&n.start>=x.start);\n  if(last)last.duration=n.start+n.duration-last.start;else merged.push(n);\n }\n postMessage({done:true,notes:merged.slice(0,30000),duration:data.length/rate});\n }catch(err){postMessage({error:String(err?.message||err)})}\n};"
   const objectURL=URL.createObjectURL(new Blob([workerCode],{type:'application/javascript'}));
   const worker=new Worker(objectURL);rollState.worker=worker;
   const notes=await new Promise((resolve,reject)=>{worker.onmessage=e=>{if(e.data.error)reject(new Error(e.data.error));if(e.data.progress!==undefined){prog.value=e.data.progress;msg.textContent='Membaca nada... '+e.data.progress+'%'}if(e.data.done)resolve(e.data.notes)};worker.onerror=reject;worker.postMessage({buffer:raw.buffer,mode:$('#analysis-mode').value,lowMidi:(INSTRUMENTS[selectedInstrument()]||INSTRUMENTS.piano).lo,highMidi:(INSTRUMENTS[selectedInstrument()]||INSTRUMENTS.piano).hi},[raw.buffer])});
@@ -730,6 +744,7 @@ function initTranscription(){
  volumeInput.addEventListener('input',e=>{midiVolumePercent=Math.max(50,Math.min(250,Number(e.target.value)||200));volumeLabel.textContent=midiVolumePercent+'%';try{localStorage.setItem('chord-atlas-midi-volume',String(midiVolumePercent));}catch(_){/* private mode */}});
  renderRoll();updateInstrumentFocus({autoMode:true});$('#instrument-focus').addEventListener('change',()=>updateInstrumentFocus({autoMode:true}));$('#analysis-mode').addEventListener('change',updateAnalysisModeHelp);$('#open-source').addEventListener('click',openReference);$('#capture-start').addEventListener('click',startTabCapture);$('#capture-stop').addEventListener('click',finishTabCapture);
  $('#source-speed').addEventListener('change',e=>$('#audio-reference').playbackRate=Number(e.target.value));
+ $('#audio-reference').addEventListener('loadedmetadata',()=>{const duration=$('#audio-reference').duration;const box=$('#source-duration');if(box)box.textContent=Number.isFinite(duration)?('Durasi sumber: '+fallTime(duration)+(duration>CAPTURE_LIMIT_SEC?' · melebihi batas 30 menit per proses':'')):'Durasi sumber tidak terbaca';});
  $('#source-audio').addEventListener('change',async e=>{const file=e.target.files?.[0];if(!file)return;if(rollState.objectURL)URL.revokeObjectURL(rollState.objectURL);rollState.objectURL=URL.createObjectURL(file);rollState.sourceBuffer=await file.arrayBuffer();rollState.sourcePCM=null;rollState.midiAll=null;$('#midi-track-info').hidden=true;rollState.filename=file.name;
   $('#audio-reference').src=rollState.objectURL;$('#analyze-audio').disabled=false;$('#analysis-message').textContent=file.name+' · siap dianalisis';$('#analysis-progress').value=0;});
  $('#source-midi').addEventListener('change',async e=>{const file=e.target.files?.[0];if(!file)return;try{const notes=readMidiNotes(await file.arrayBuffer());rollState.midiAll=notes;rollState.sourceBuffer=null;rollState.sourcePCM=null;applyImportedMidiFocus({scroll:true});toast('MIDI dibaca. Pilih instrumen untuk menyaring jalurnya.');}catch(err){toast('File MIDI gagal dibaca: '+err.message)}});
@@ -868,7 +883,7 @@ async function aiSeparateAndTranscribe(){
     if(detected.length){
      aiStudio.original=rollState.notes.map(n=>({...n}));$('#ai-restore-original').disabled=false;
      stopRoll();rollState.notes=detected.map(n=>({...n,source:'analyzed'}));
-     rollState.seconds=Math.max(16,detected.reduce((m,n)=>Math.max(m,n.start+n.duration),0)+2);
+     rollState.seconds=Math.max(16,Number(job.audio_duration)||0,detected.reduce((m,n)=>Math.max(m,n.start+n.duration),0)+2);
      rollState.playhead=-2.8;rollState.midiAll=null;renderRoll();
      aiReport('Stem tersedia untuk didengarkan. '+detected.length+' nada masuk Piano Roll. Ini hasil perkiraan AI, belum tentu tepat.');
     }else aiReport('Stem piano berhasil dibuat, tapi tidak ada not yang terdeteksi. Dengarkan hasilnya atau coba mode Audio piano bersih.');
@@ -1040,7 +1055,7 @@ async function stemToMidi(name,button){
   const notes=(data.notes||[]).filter(n=>Number.isFinite(n.midi)&&Number.isFinite(n.start)&&Number.isFinite(n.duration));
   if(notes.length){
    stopRoll();rollState.notes=notes.map(n=>({...n,source:'analyzed'}));rollState.midiAll=null;
-   rollState.seconds=Math.max(16,notes.reduce((m,n)=>Math.max(m,n.start+n.duration),0)+2);rollState.playhead=-2.8;renderRoll();
+   rollState.seconds=Math.max(16,Number(data.audio_duration)||0,notes.reduce((m,n)=>Math.max(m,n.start+n.duration),0)+2);rollState.playhead=-2.8;renderRoll();
    stemMsg(notes.length+' nada perkiraan dari stem '+name+' sudah masuk Piano Roll. Periksa nadanya dulu.');
   }else stemMsg('MIDI dibuat, tapi tidak ada not yang terbaca. Coba stem lain.');
   await stemRefresh();
